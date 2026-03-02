@@ -201,11 +201,11 @@ def main() -> None:
 
     log_clamp_min = 1e-12
     val_split = 0.05
-    batch_size = 128
+    batch_size = 256
     epochs = 2000
-    lr = 2e-5
-    beta = 1e-4
-    kl_warmup_epochs = 200
+    lr = 2e-4
+    beta = 1e-2
+    kl_warmup_epochs = 600
     recon_beta = 0.5
     tv_lambda = 3e-4
     num_workers = 16
@@ -246,7 +246,7 @@ def main() -> None:
         drop_last=False,
     )
 
-    model = UNetVAE().to(device)
+    model = UNetVAE(base_channels=8, latent_channels=8).to(device)
     model = torch.compile(model)
 
     loss_fn = TVHuberLoss3D(
@@ -259,7 +259,10 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=1e-3)
     amp_device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-    save_root = Path("saved_runs") / args.save_dir
+    beta_tag = f"beta{beta:.0e}"
+    kl_tag = f"kl{kl_warmup_epochs}"
+    save_dir = f"{args.save_dir}_{beta_tag}_{kl_tag}"
+    save_root = Path("saved_runs") / save_dir
     (save_root / "checkpoints").mkdir(parents=True, exist_ok=True)
     (save_root / "samples").mkdir(parents=True, exist_ok=True)
 
@@ -346,7 +349,7 @@ def main() -> None:
         if epoch % 5 == 0 or epoch == epochs:
             sample = next(iter(val_loader))[0][:1].to(device)
             recon, _, _ = ema_model.module(sample)
-            prior_z = torch.randn((1, 16, 8, 8), device=device)
+            prior_z = torch.randn((1, 8, 8, 8), device=device)
             prior_sample = ema_model.module.decode(prior_z)
             save_slices(
                 sample,

@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from models.VAE.default import CNNVAE
+from models.VAE.cnn import CNNVAE
 
 
 def load_sigma_dataset(
