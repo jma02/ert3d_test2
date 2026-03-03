@@ -64,12 +64,10 @@ class DownBlock3D(nn.Module):
         self.res2 = ResBlock3D(in_channels, in_channels, groups, dropout)
         self.down = Downsample3D(in_channels, out_channels, stride)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.res1(x)
         h = self.res2(h)
-        skip = h
-        h = self.down(h)
-        return h, skip
+        return self.down(h)
 
 
 class UpBlock3D(nn.Module):
@@ -77,22 +75,17 @@ class UpBlock3D(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        skip_channels: int,
         scale_factor: tuple[int, int, int],
         groups: int,
         dropout: float,
     ) -> None:
         super().__init__()
-        self.skip_channels = skip_channels
         self.up = Upsample3D(in_channels, out_channels, scale_factor)
-        self.res1 = ResBlock3D(out_channels + skip_channels, out_channels, groups, dropout)
+        self.res1 = ResBlock3D(out_channels, out_channels, groups, dropout)
         self.res2 = ResBlock3D(out_channels, out_channels, groups, dropout)
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.up(x)
-        if skip is None:
-            skip = h.new_zeros((h.shape[0], self.skip_channels, h.shape[2], h.shape[3], h.shape[4]))
-        h = torch.cat((h, skip), dim=1)
         h = self.res1(h)
         h = self.res2(h)
         return h
@@ -128,8 +121,6 @@ class UNetVAE(nn.Module):
 
         channels = [base_channels, base_channels * 2, base_channels * 4]
         channels += [base_channels * 4] * (len(self.down_strides) - 2)
-        self.skip_channels = channels[:-1]
-
         self.down_blocks = nn.ModuleList(
             [
                 DownBlock3D(channels[i], channels[i + 1], self.down_strides[i], groups, dropout)
@@ -149,7 +140,6 @@ class UNetVAE(nn.Module):
                 UpBlock3D(
                     channels[-1 - i],
                     channels[-2 - i],
-                    self.skip_channels[-1 - i],
                     self.up_strides[i],
                     groups,
                     dropout,
@@ -171,19 +161,17 @@ class UNetVAE(nn.Module):
 
         self.apply(_basic_init)
 
-    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.input_proj(x)
-        skips: list[torch.Tensor] = []
         for block in self.down_blocks:
-            h, skip = block(h)
-            skips.append(skip)
+            h = block(h)
 
         h = self.mid1(h)
         h = self.mid2(h)
 
         mu = self.mu(h).squeeze(2)
         logvar = self.logvar(h).squeeze(2)
-        return mu, logvar, skips
+        return mu, logvar
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
@@ -191,19 +179,16 @@ class UNetVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def decode(self, z: torch.Tensor, skips: list[torch.Tensor] | None = None) -> torch.Tensor:
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
         h = self.latent_proj(z.unsqueeze(2))
-        if skips is not None:
-            skips = list(skips)
         for block in self.up_blocks:
-            skip = skips.pop() if skips else None
-            h = block(h, skip)
+            h = block(h)
         return self.final(h)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, logvar, skips = self.encode(x)
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        recon = self.decode(z, skips)
+        recon = self.decode(z)
         return recon, mu, logvar
 
 
