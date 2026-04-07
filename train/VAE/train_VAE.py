@@ -3,23 +3,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 from models.VAE.cnn import CNNVAE
+from train.VAE.util import plot_vae_loss_curves, save_vae_slices, tv3d_iso
 
 
 def load_sigma_dataset(
     path: Path,
-    log_clamp_min: float,
+    log_eps: float,
 ) -> tuple[torch.Tensor, np.ndarray, np.ndarray, np.ndarray]:
     data = np.load(path, allow_pickle=True).item()
     sigma = data["Y"].astype(np.float32, copy=False)
     sigma = sigma[:, None, ...]
-    sigma = np.log(np.clip(sigma, log_clamp_min, None))
+    sigma = np.log(sigma + log_eps)
     xq = data["xq"].astype(np.float32, copy=False)
     yq = data["yq"].astype(np.float32, copy=False)
     zq = data["zq"].astype(np.float32, copy=False)
@@ -28,104 +27,7 @@ def load_sigma_dataset(
 
 def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-
-def tv3d_iso(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    dz = u[..., 1:, :, :] - u[..., :-1, :, :]
-    dy = u[..., :, 1:, :] - u[..., :, :-1, :]
-    dx = u[..., :, :, 1:] - u[..., :, :, :-1]
-    dz = F.pad(dz, (0, 0, 0, 0, 0, 1))
-    dy = F.pad(dy, (0, 0, 0, 1, 0, 0))
-    dx = F.pad(dx, (0, 1, 0, 0, 0, 0))
-    return torch.sqrt(dx * dx + dy * dy + dz * dz + eps).mean()
-
-
-def save_slices(
-    target: torch.Tensor,
-    recon: torch.Tensor,
-    out_path: Path,
-    xq: np.ndarray,
-    yq: np.ndarray,
-    zq: np.ndarray,
-    sigma_min: float,
-    max_points: int,
-    generated: torch.Tensor,
-) -> None:
-
-    target = target.detach().cpu().squeeze(0).squeeze(0).numpy()
-    recon = recon.detach().cpu().squeeze(0).squeeze(0).numpy()
-    generated_np = generated.detach().cpu().squeeze(0).squeeze(0).numpy()
-
-    zz, yy, xx = np.meshgrid(zq, yq, xq, indexing="ij")
-    xx = xx.reshape(-1)
-    yy = yy.reshape(-1)
-    zz = zz.reshape(-1)
-
-    def sample_points(vol: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        sigma = vol.reshape(-1)
-        mask = sigma > sigma_min
-        x = xx[mask]
-        y = yy[mask]
-        z = zz[mask]
-        sigma = sigma[mask]
-        if sigma.size == 0:
-            return x, y, z, sigma
-        if sigma.size > max_points:
-            idx = np.linspace(0, sigma.size - 1, max_points).astype(int)
-            x = x[idx]
-            y = y[idx]
-            z = z[idx]
-            sigma = sigma[idx]
-        return x, y, z, sigma
-
-    x_t, y_t, z_t, s_t = sample_points(target)
-    x_r, y_r, z_r, s_r = sample_points(recon)
-    x_g, y_g, z_g, s_g = sample_points(generated_np)
-
-    def scatter_with_alpha(ax, x, y, z, sigma, title, norm, cmap):
-        vmin = float(norm.vmin)
-        vmax = float(norm.vmax)
-        denom = vmax - vmin if vmax > vmin else 1.0
-        alpha = (vmax - sigma) / denom
-        alpha = np.clip(alpha, 0.05, 1.0)
-
-        colors = cmap(norm(sigma))
-        colors[:, 3] = alpha
-
-        sc = ax.scatter(x, y, z, c=colors, s=4)
-        ax.set_title(title)
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        return sc
-
-    target_min = float(s_t.min())
-    target_max = float(s_t.max())
-    norm = plt.Normalize(vmin=target_min, vmax=target_max)
-    cmap = plt.get_cmap("plasma")
-    mappable = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-    mappable.set_array([])
-
-    ncols = 3
-    fig = plt.figure(figsize=(5 * ncols, 4))
-    ax1 = fig.add_subplot(1, ncols, 1, projection="3d")
-    ax2 = fig.add_subplot(1, ncols, 2, projection="3d")
-    ax3 = fig.add_subplot(1, ncols, 3, projection="3d")
-
-    scatter_with_alpha(ax1, x_t, y_t, z_t, s_t, "target", norm, cmap)
-    fig.colorbar(mappable, ax=ax1, fraction=0.03, pad=0.08, label="log(sigma)")
-
-    scatter_with_alpha(ax2, x_r, y_r, z_r, s_r, "recon", norm, cmap)
-    fig.colorbar(mappable, ax=ax2, fraction=0.03, pad=0.08, label="log(sigma)")
-
-    scatter_with_alpha(ax3, x_g, y_g, z_g, s_g, "prior sample", norm, cmap)
-    fig.colorbar(mappable, ax=ax3, fraction=0.03, pad=0.08, label="log(sigma)")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
+    
 torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -146,7 +48,7 @@ def main() -> None:
 
     device = args.device
 
-    log_clamp_min = 1e-12
+    log_eps = 1e-6
     val_split = 0.05
     batch_size = 512
     epochs = 2000
@@ -155,12 +57,12 @@ def main() -> None:
     recon_beta = 0.5
     tv_lambda = 3e-4
     num_workers = 8
-    sigma_min = float(np.log(log_clamp_min))
+    sigma_min = float(np.log(log_eps))
     max_plot_points = 2000
 
     sigma, xq, yq, zq = load_sigma_dataset(
         Path(args.data_path),
-        log_clamp_min=log_clamp_min,
+        log_eps=log_eps,
     )
 
     dataset = TensorDataset(sigma)
@@ -200,18 +102,33 @@ def main() -> None:
 
     start_epoch = 1
     best_val_loss = float("inf")
+    early_stopping_patience = 50
+    epochs_without_improvement = 0
+    last_epoch = start_epoch - 1
     if args.ckpt is not None:
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optim_state_dict"])
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
 
+    loss_history = {
+        "train_total": [],
+        "train_recon": [],
+        "train_kl": [],
+        "val_total": [],
+        "val_recon": [],
+        "val_kl": [],
+    }
+
     epoch_bar = tqdm(range(start_epoch, epochs + 1), desc="Epochs")
     for epoch in epoch_bar:
+        last_epoch = epoch
         model.train()
-        train_loss = 0.0
-        train_recon = 0.0
-        train_kl = 0.0
+        train_loss = torch.tensor(0.0, device=device)
+        train_recon = torch.tensor(0.0, device=device)
+        train_kl = torch.tensor(0.0, device=device)
+        val_recon = torch.tensor(0.0, device=device)
+        val_kl = torch.tensor(0.0, device=device)
 
         for (x,) in tqdm(train_loader, desc=f"Epoch {epoch} train", leave=False):
             x = x.to(device)
@@ -233,7 +150,7 @@ def main() -> None:
             train_kl += kl_loss.item()
 
         model.eval()
-        val_loss = 0.0
+        val_loss = torch.tensor(0.0, device=device)
         with torch.no_grad():
             for (x,) in val_loader:
                 x = x.to(device)
@@ -242,36 +159,59 @@ def main() -> None:
                 kl_loss = kl_divergence(mu, logvar)
                 tv_loss = tv3d_iso(recon)
                 val_loss += (recon_loss + beta * kl_loss + tv_lambda * tv_loss).item()
+                val_recon += recon_loss.item()
+                val_kl += kl_loss.item()
 
-        train_loss /= max(1, len(train_loader))
-        val_loss /= max(1, len(val_loader))
+        train_loss = float((train_loss / max(1, len(train_loader))).item())
+        val_loss = float((val_loss / max(1, len(val_loader))).item())
+        avg_train_recon = float((train_recon / max(1, len(train_loader))).item())
+        avg_train_kl = float((train_kl / max(1, len(train_loader))).item())
+        avg_val_recon = float((val_recon / max(1, len(val_loader))).item())
+        avg_val_kl = float((val_kl / max(1, len(val_loader))).item())
         epoch_bar.set_postfix(
             train=f"{train_loss:.6f}",
-            recon=f"{train_recon / max(1, len(train_loader)):.6f}",
-            kl=f"{train_kl / max(1, len(train_loader)):.6f}",
+            recon=f"{avg_train_recon:.6f}",
+            kl=f"{avg_train_kl:.6f}",
             val=f"{val_loss:.6f}",
+        )
+
+        loss_history["train_total"].append(train_loss)
+        loss_history["train_recon"].append(avg_train_recon)
+        loss_history["train_kl"].append(avg_train_kl)
+        loss_history["val_total"].append(val_loss)
+        loss_history["val_recon"].append(avg_val_recon)
+        loss_history["val_kl"].append(avg_val_kl)
+
+        plot_vae_loss_curves(
+            loss_history,
+            "VAE loss",
+            out_path=str(save_root / "loss_curve.png"),
         )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            epochs_without_improvement = 0
             checkpoint = {
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optim_state_dict": optimizer.state_dict(),
-                "log_clamp_min": log_clamp_min,
+                "log_eps": log_eps,
                 "best_val_loss": float(best_val_loss),
             }
             torch.save(checkpoint, save_root / "checkpoints" / "best_val_loss.pt")
+        else:
+            epochs_without_improvement += 1
 
-        if epoch % 10 == 0 or epoch == epochs:
+        if epoch % 100 == 0 or epoch == epochs:
             sample = next(iter(val_loader))[0][:1].to(device)
             recon, _, _ = model(sample)
-            prior_z = torch.randn((1, 16, 16, 16), device=device)
+            mu, _ = model.encode(sample)
+            prior_z = torch.randn_like(mu)
             prior_sample = model.decode(prior_z)
-            save_slices(
+            save_vae_slices(
                 sample,
                 recon,
-                save_root / "samples" / f"recon_epoch_{epoch}.png",
+                str(save_root / "samples" / f"recon_epoch_{epoch}.png"),
                 xq,
                 yq,
                 zq,
@@ -280,11 +220,17 @@ def main() -> None:
                 generated=prior_sample,
             )
 
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"Early stopping at epoch {epoch} after {early_stopping_patience} epochs without validation improvement."
+            )
+            break
+
     final_checkpoint = {
-        "epoch": epochs,
+        "epoch": last_epoch,
         "model_state_dict": model.state_dict(),
         "optim_state_dict": optimizer.state_dict(),
-        "log_clamp_min": log_clamp_min,
+        "log_eps": log_eps,
         "best_val_loss": float(best_val_loss),
     }
     torch.save(final_checkpoint, save_root / "checkpoints" / "final_model.pt")

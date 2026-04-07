@@ -1,16 +1,16 @@
 import argparse
+import json
 import os
 
 import numpy as np
 from tqdm import tqdm
 
 import torch
-from torch.utils.data import DataLoader, TensorDataset
-from torch import nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from models.unet import Unet
+from train.util import TVHuberLoss2D
+from train.no_encoder.util import plot_no_encoder_loss_curves, save_no_encoder_slices
 
 
 torch.manual_seed(159753)
@@ -23,140 +23,77 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(True)
-
-
-def tv2d_aniso(u: torch.Tensor) -> torch.Tensor:
-    dx = u[..., :, 1:] - u[..., :, :-1]
-    dy = u[..., 1:, :] - u[..., :-1, :]
-    return dx.abs().mean() + dy.abs().mean()
-
-
-def tv2d_iso(u: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    dx = u[..., :, 1:] - u[..., :, :-1]
-    dy = u[..., 1:, :] - u[..., :-1, :]
-    dx = F.pad(dx, (0, 1, 0, 0))
-    dy = F.pad(dy, (0, 0, 0, 1))
-    return torch.sqrt(dx * dx + dy * dy + eps).mean()
-
-
-class TVHuberLoss(nn.Module):
-    """
-    loss = SmoothL1(pred, target) + lam_tv * TV(pred)
-    Optional: TV on residual instead (tv_on="residual").
-    Optional: simple reweighting of the inclusion region (w_in>1).
-    """
-
-    def __init__(
-        self,
-        lam_tv: float = 1e-3,
-        beta: float = 1.0,
-        tv: str = "iso",
-        tv_on: str = "pred",
-        w_in: float = 1.0,
-        thresh: float = 0.5,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.lam_tv = lam_tv
-        self.beta = beta
-        self.tv = tv
-        self.tv_on = tv_on
-        self.w_in = w_in
-        self.thresh = thresh
-        self.eps = eps
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_f = pred.float()
-        target_f = target.float()
-
-        r = pred_f - target_f
-
-        if self.w_in > 1.0:
-            bg = target_f.flatten(2).median(dim=-1).values[..., None, None]
-            mask = (target_f - bg).abs() > self.thresh
-            w = 1.0 + (self.w_in - 1.0) * mask.float()
-            data = (w * F.smooth_l1_loss(pred_f, target_f, beta=self.beta, reduction="none")).mean()
-        else:
-            data = F.smooth_l1_loss(pred_f, target_f, beta=self.beta)
-
-        tv_arg = pred_f if self.tv_on == "pred" else r
-        if self.tv == "aniso":
-            reg = tv2d_aniso(tv_arg)
-        else:
-            reg = tv2d_iso(tv_arg, eps=self.eps)
-
-        return data + self.lam_tv * reg
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="data/3dert_test2_easy.npy")
     parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default="unet_easy_no_encoder")
+    parser.add_argument("--lr", type=float, default=5e-3)
+    parser.add_argument("--epochs", type=int, default=250)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--unet_ch", type=int, default=64)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     args = parser.parse_args()
 
-    epochs = 250
-    batch_size = 64
-    lr = 5e-3
-    log_clamp_min = 1e-12
+    epochs = args.epochs
+    batch_size = args.batch_size
+    unet_ch = args.unet_ch
+    lr = args.lr
+    weight_decay = args.weight_decay
+    log_eps = 1e-6
+    device = torch.device(args.device)
 
     data = np.load(args.data, allow_pickle=True).item()
-    x = torch.from_numpy(np.asarray(data["X"], dtype=np.float32))
-    y = torch.from_numpy(np.asarray(data["Y_easy"], dtype=np.float32))
+    x = torch.from_numpy(np.asarray(data["X"], dtype=np.float32)).to(device)
+    y = torch.from_numpy(np.asarray(data["Y_easy"], dtype=np.float32)).to(device)
+
+    y = torch.log(y + log_eps)
 
     n_samples, in_c, in_h, in_w = x.shape
     _, out_c, out_h, out_w = y.shape
 
-    perm = torch.randperm(n_samples)
-    split = int(0.9 * n_samples)
-    train_idx = perm[:split]
-    val_idx = perm[split:]
-
-    x_train = x[train_idx]
-    x_val = x[val_idx]
-    y_train = y[train_idx]
-    y_val = y[val_idx]
-
-    y_train = torch.log(torch.clamp(y_train, min=log_clamp_min))
-    y_val = torch.log(torch.clamp(y_val, min=log_clamp_min))
-
-    train_ds = TensorDataset(x_train, y_train)
-    val_ds = TensorDataset(x_val, y_val)
+    dataset = TensorDataset(x, y)
+    train_size = int(0.8 * n_samples)
+    val_size = int(0.1 * n_samples)
+    test_size = n_samples - train_size - val_size
+    train_ds, val_ds, test_ds = random_split(
+        dataset,
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(159753),
+    )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=8,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
         drop_last=True,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=8,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
         drop_last=False,
     )
-
-    device = torch.device(args.device)
 
     model = Unet(
         in_channels=in_c,
         out_channels=out_c,
         output_shape=(out_h, out_w),
-        ch=64,
+        ch=unet_ch,
     ).to(device)
-    model = torch.compile(model)
+    model = torch.compile(model, mode="max-autotune")
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total number of parameters: {total_params}")
 
-    optim = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=1e-3)
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=weight_decay, fused=True)
 
-    loss_fn = TVHuberLoss(
+    loss_fn = TVHuberLoss2D(
         lam_tv=3e-4,
         beta=0.5,
         tv="iso",
@@ -165,13 +102,34 @@ def main() -> None:
         thresh=0.5,
     )
 
-    os.makedirs(f"saved_runs/{args.save_dir}", exist_ok=True)
-    os.chdir(f"saved_runs/{args.save_dir}")
+    save_dir = args.save_dir
+    save_dir += f"_lr{lr:.0e}_bs{batch_size}_ep{epochs}"
+    save_dir += f"_unet_ch{unet_ch}_wd{weight_decay:.0e}"
+
+    os.makedirs(f"saved_runs/{save_dir}", exist_ok=True)
+    os.chdir(f"saved_runs/{save_dir}")
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("samples", exist_ok=True)
 
+    with open("hparams.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "ckpt": args.ckpt,
+                "save_dir": save_dir,
+                "lr": lr,
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "unet_ch": unet_ch,
+                "weight_decay": weight_decay,
+            },
+            f,
+            indent=2,
+        )
+
     ckpt = args.ckpt
     best_val_loss = float("inf")
+    early_stopping_patience = 50
+    epochs_without_improvement = 0
 
     if ckpt is not None:
         checkpoint = torch.load(ckpt, map_location="cpu")
@@ -184,12 +142,18 @@ def main() -> None:
         start_epoch = 0
         log_step = 0
 
+    last_epoch = start_epoch - 1
+
+    train_loss_history: list[float] = []
+    val_loss_history: list[float] = []
+
     pbar = tqdm(range(start_epoch, epochs + 1), desc="Epochs")
     for epoch in pbar:
+        last_epoch = epoch
         model.train()
+        train_running_loss = torch.tensor(0.0, device=device)
+        train_batches = 0
         for x_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch}", leave=False):
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
 
             optim.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -202,18 +166,32 @@ def main() -> None:
             loss.backward()
             optim.step()
             log_step += 1
+            train_running_loss += loss.item()
+            train_batches += 1
 
         model.eval()
         with torch.no_grad():
-            x_batch, y_batch = next(iter(val_loader))
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            pred = model(x_batch)
-            val_loss = loss_fn(pred, y_batch).item()
-            pbar.set_postfix({"val_loss": f"{val_loss:.5f}"})
+            val_running_loss = torch.tensor(0.0, device=device)
+            val_batches = 0
+            for x_batch, y_batch in val_loader:
+                pred = model(x_batch)
+                val_running_loss += loss_fn(pred, y_batch)
+                val_batches += 1
+            train_loss = float((train_running_loss / max(1, train_batches)).item())
+            val_loss = float((val_running_loss / max(1, val_batches)).item())
+            pbar.set_postfix(
+                {
+                    "train_loss": f"{train_loss:.5f}",
+                    "val_loss": f"{val_loss:.5f}",
+                }
+            )
+
+            train_loss_history.append(train_loss)
+            val_loss_history.append(val_loss)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                epochs_without_improvement = 0
                 model_to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
                 checkpoint = {
                     "epoch": int(epoch),
@@ -222,48 +200,42 @@ def main() -> None:
                     "optim_state_dict": optim.state_dict(),
                     "best_val_loss": float(best_val_loss),
                 }
-                torch.save(checkpoint, "checkpoints/best_val_loss.tar")
+                torch.save(checkpoint, "checkpoints/best_val_loss.pt")
+            else:
+                epochs_without_improvement += 1
 
-            xq = data["xq"]
-            zq = data["zq"]
-            extent = (float(xq[0]), float(xq[-1]), float(zq[0]), float(zq[-1]))
+            if epoch % 50 == 0 or epoch == epochs:
+                xq = data["xq"]
+                zq = data["zq"]
+                extent = (float(xq[0]), float(xq[-1]), float(zq[0]), float(zq[-1]))
+                save_no_encoder_slices(
+                    target=y_batch[0].detach().cpu().numpy(),
+                    pred=pred[0].detach().cpu().numpy(),
+                    out_path=f"samples/epoch_{epoch}.png",
+                    extent=extent,
+                )
+                plot_no_encoder_loss_curves(
+                    train_loss_history,
+                    val_loss_history,
+                    "Loss",
+                    out_path="loss_curve.png",
+                )
 
-            plt.rcParams["font.family"] = "DejaVu Serif"
-            title_font = {"family": "DejaVu Serif", "weight": "bold", "size": 12}
+            if epochs_without_improvement >= early_stopping_patience:
+                print(
+                    f"Early stopping at epoch {epoch} after {early_stopping_patience} epochs without validation improvement."
+                )
+                break
 
-            y_log = y_batch[0].detach().cpu().numpy()
-            pred_log = pred[0].detach().cpu().numpy()
-            abs_err = np.abs(pred_log - y_log)
-
-            fig, axs = plt.subplots(3, 3, figsize=(16, 10), gridspec_kw={"width_ratios": [1, 1, 1]})
-            for idx in range(min(3, y_log.shape[0])):
-                plots = [
-                    (y_log[idx], "Ground Truth (log)"),
-                    (pred_log[idx], "Prediction (log)"),
-                    (abs_err[idx], "Abs Error"),
-                ]
-                for ax, (values, title) in zip(axs[idx, :], plots):
-                    if title in {"Ground Truth (log)", "Prediction (log)"}:
-                        im = ax.imshow(
-                            values,
-                            origin="lower",
-                            aspect="auto",
-                            extent=extent,
-                            cmap="Blues",
-                            vmin=y_log[idx].min(),
-                            vmax=y_log[idx].max(),
-                        )
-                    else:
-                        im = ax.imshow(values, origin="lower", aspect="auto", extent=extent, cmap="Blues")
-                    ax.set_title(f"Slice {idx + 1}: {title}", fontdict=title_font)
-                    ax.set_xlabel("X")
-                    ax.set_ylabel("Z")
-                    cb = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.04, shrink=0.75)
-                    cb.ax.tick_params(labelsize=9)
-
-            plt.tight_layout()
-            fig.savefig(f"samples/epoch_{epoch}.png", dpi=150, bbox_inches="tight")
-            plt.close(fig)
+    model_to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
+    final_checkpoint = {
+        "epoch": int(last_epoch),
+        "log_step": int(log_step),
+        "model_state_dict": model_to_save.state_dict(),
+        "optim_state_dict": optim.state_dict(),
+        "best_val_loss": float(best_val_loss),
+    }
+    torch.save(final_checkpoint, "checkpoints/final.pt")
 
 if __name__ == "__main__":
     main()

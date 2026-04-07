@@ -6,7 +6,7 @@ import torch.nn as nn
 from .modules import (
     Downsample,
     Upsample,
-    ResBlockNoTime,
+    ResBlock,
 )
 
 
@@ -106,11 +106,11 @@ class Unet(nn.Module):
         transition = self.make_transition(res, down)
         
         if down:
-            block1 = ResBlockNoTime(dim, dim, self.groups, self.dropout)
-            block2 = ResBlockNoTime(dim, dim, self.groups, self.dropout)
+            block1 = ResBlock(dim, dim, self.groups, self.dropout)
+            block2 = ResBlock(dim, dim, self.groups, self.dropout)
         else:
-            block1 = ResBlockNoTime(2 * dim, dim, self.groups, self.dropout)
-            block2 = ResBlockNoTime(dim, dim, self.groups, self.dropout)
+            block1 = ResBlock(2 * dim, dim, self.groups, self.dropout)
+            block2 = ResBlock(dim, dim, self.groups, self.dropout)
         
         return nn.ModuleList([block1, block2, transition])
  
@@ -135,6 +135,6 @@ class Unet(nn.Module):
 
         nch = self.ch * self.ch_mul[-1]
         self.mid = nn.ModuleList([
-            ResBlockNoTime(nch, nch, self.groups, self.dropout),
-            ResBlockNoTime(nch, nch, self.groups, self.dropout),
+            ResBlock(nch, nch, self.groups, self.dropout),
+            ResBlock(nch, nch, self.groups, self.dropout),
         ])

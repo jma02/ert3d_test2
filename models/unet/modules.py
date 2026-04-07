@@ -105,7 +105,7 @@ class ConditionalResBlock(nn.Module):
         h = (self.skip_connection(x) + h) / np.sqrt(2.0)
         return h
     
-class ResBlockNoTime(nn.Module):
+class ResBlock(nn.Module):
     def __init__(self, dim_in, dim_out, num_groups=32, dropout=0.1, attn=False):
         super().__init__()
 

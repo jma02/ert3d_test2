@@ -190,18 +190,3 @@ class UNetVAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z)
         return recon, mu, logvar
-
-
-class UNetVAE_S(UNetVAE):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(base_channels=8, **kwargs)
-
-
-class UNetVAE_M(UNetVAE):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(base_channels=16, **kwargs)
-
-
-class UNetVAE_L(UNetVAE):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(base_channels=32, **kwargs)

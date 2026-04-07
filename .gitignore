@@ -13,3 +13,9 @@ wheels/
 .venv
 
 saved_runs/
+eval_outputs/
+perf/
+plot_outputs/
+viewer/
+
+traces*
